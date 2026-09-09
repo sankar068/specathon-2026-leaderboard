@@ -55,7 +55,9 @@ export const venueGroups = mysqlTable("venueGroups", {
   groupName: varchar("groupName", { length: 100 }).notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-});
+}, (table) => ({
+  groupNameUnique: uniqueIndex("venue_groups_name_unique").on(table.groupName),
+}));
 
 export const venueGroupMembers = mysqlTable("venueGroupMembers", {
   id: int("id").autoincrement().primaryKey(),
@@ -70,7 +72,7 @@ export const scoreAuditLog = mysqlTable("scoreAuditLog", {
   teamId: int("teamId").notNull().references(() => teams.id, { onDelete: "cascade" }),
   round: mysqlEnum("round", ["ROUND_1", "ROUND_2"]).notNull(),
   oldScore: int("oldScore"),
-  newScore: int("newScore").notNull(),
+  newScore: int("newScore"),
   changedBy: int("changedBy").notNull().references(() => users.id),
   changedAt: timestamp("changedAt").defaultNow().notNull(),
 }, (table) => ({

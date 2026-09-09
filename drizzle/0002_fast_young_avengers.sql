@@ -1,0 +1,1 @@
+ALTER TABLE `venueGroups` ADD CONSTRAINT `venue_groups_name_unique` UNIQUE(`groupName`);

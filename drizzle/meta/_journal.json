@@ -15,6 +15,20 @@
       "when": 1788962051060,
       "tag": "0001_fluffy_nova",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1788964044108,
+      "tag": "0002_fast_young_avengers",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1788964088331,
+      "tag": "0003_wide_plazm",
+      "breakpoints": true
     }
   ]
 }

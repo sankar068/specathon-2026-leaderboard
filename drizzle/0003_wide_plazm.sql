@@ -1,0 +1,1 @@
+ALTER TABLE `scoreAuditLog` MODIFY COLUMN `newScore` int;
