@@ -7,6 +7,9 @@ import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { clearScore, getAuditLog, getDb, getEventSettings, getLeaderboardRows, getTeams, getVenueGroups, importTeams, saveVenueGroup, deleteVenueGroup, updateScore, updateTeam } from "./db";
 import { eventSettings, venueGroupMembers, venueGroups } from "../drizzle/schema";
 import { rankLeaderboardRows } from "./ranking";
+import { clearAdminSession, clearFailedAttempts, isRateLimited, recordFailedAttempt, setAdminSession, verifyAdminPassword } from "./adminAuth";
+import { upsertUser } from "./db";
+import { ENV } from "./_core/env";
 
 const adminProcedure = protectedProcedure.use(async ({ ctx, next }) => { if (ctx.user.role !== "admin") throw new TRPCError({ code: "FORBIDDEN", message: "Administrator access required" }); return next(); });
 const venueSchema = z.string().trim().min(1).max(32).regex(/^G\d+$/i, "Venue must be a code such as G1 or G20");
@@ -16,7 +19,21 @@ const stageSchema = z.enum(stages);
 
 export const appRouter = router({
   system: systemRouter,
-  auth: router({ me: publicProcedure.query(opts => opts.ctx.user), logout: publicProcedure.mutation(({ ctx }) => { const options = getSessionCookieOptions(ctx.req); ctx.res.clearCookie(COOKIE_NAME, { ...options, maxAge: -1 }); return { success: true } as const; }) }),
+  auth: router({
+    me: publicProcedure.query(opts => opts.ctx.user),
+    adminLogin: publicProcedure.input(z.object({ email: z.string().trim().email(), password: z.string().min(1).max(200) })).mutation(async ({ ctx, input }) => {
+      const ip = ctx.req.ip || "unknown";
+      if (isRateLimited(ip)) throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Too many failed attempts. Try again later." });
+      if (!ENV.adminEmail || !ENV.adminPasswordHash) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Admin login is not configured." });
+      if (!verifyAdminPassword(input.email, input.password)) { recordFailedAttempt(ip); throw new TRPCError({ code: "UNAUTHORIZED", message: "Invalid email or password." }); }
+      clearFailedAttempts(ip);
+      const openId = `specathon-admin:${ENV.adminEmail.trim().toLowerCase()}`;
+      await upsertUser({ openId, email: ENV.adminEmail, name: "Specathon Administrator", loginMethod: "specathon-admin", role: "admin" });
+      setAdminSession(ctx.res, openId);
+      return { success: true } as const;
+    }),
+    logout: publicProcedure.mutation(({ ctx }) => { const options = getSessionCookieOptions(ctx.req); ctx.res.clearCookie(COOKIE_NAME, { ...options, maxAge: -1 }); clearAdminSession(ctx.res); return { success: true } as const; }),
+  }),
   leaderboard: router({ data: publicProcedure.query(async () => { const [settings, rows, groups] = await Promise.all([getEventSettings(), getLeaderboardRows(), getVenueGroups()]); return { settings, groups, teams: rankLeaderboardRows(rows, settings.currentStage) }; }) }),
   admin: router({
     summary: adminProcedure.query(async () => { const [settings, rows, audit] = await Promise.all([getEventSettings(), getTeams(), getAuditLog(8)]); return { settings, totalTeams: rows.length, round1Evaluated: rows.filter(row => row.round1Score !== null && row.round1Score !== undefined).length, round2Evaluated: rows.filter(row => row.round2Score !== null && row.round2Score !== undefined).length, recentAudit: audit }; }),
