@@ -1,5 +1,4 @@
 import { trpc } from "@/lib/trpc";
-import { Link } from "wouter";
 import { Activity, ArrowUpRight, BarChart3, ChevronDown, CircleDot, Radio, ShieldCheck, Trophy } from "lucide-react";
 import { useMemo, useState } from "react";
 
@@ -39,10 +38,9 @@ export default function Home() {
               <p className="font-display text-sm font-semibold tracking-[0.16em] text-white">SPECATHON 2026</p>
             </div>
           </div>
-          <div className="flex items-center gap-3 text-xs text-slate-400">
-            <span className="hidden sm:inline">Public view</span>
-            <Link href="/admin" className="control-link">Admin console <ArrowUpRight size={14} /></Link>
-          </div>
+            <div className="flex items-center gap-3 text-xs text-slate-400">
+              <span className="hidden sm:inline">Public view</span>
+            </div>
         </header>
 
         <section className="mx-auto max-w-[1480px] px-5 pb-8 lg:px-10 lg:pb-12">
