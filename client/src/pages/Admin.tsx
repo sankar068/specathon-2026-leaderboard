@@ -1,0 +1,120 @@
+import { useAuth } from "@/_core/hooks/useAuth";
+import { startLogin } from "@/const";
+import { trpc } from "@/lib/trpc";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import * as XLSX from "xlsx";
+import { AlertTriangle, ArrowLeft, Check, FileSpreadsheet, Gauge, History, LogOut, Save, Search, Settings2, ShieldCheck, Upload, Users, X } from "lucide-react";
+import { ComponentType, useRef, useState } from "react";
+import { Link } from "wouter";
+import { toast } from "sonner";
+
+const stages = ["ROUND_1_UPCOMING", "ROUND_1_LIVE", "ROUND_1_COMPLETED", "ROUND_2_UPCOMING", "ROUND_2_LIVE", "ROUND_2_COMPLETED", "FINAL_UPCOMING", "FINAL_LIVE", "FINAL_COMPLETED", "RESULTS_LIVE"] as const;
+const stageLabels: Record<string, string> = { ROUND_1_UPCOMING: "Round 1 · Upcoming", ROUND_1_LIVE: "Round 1 · Live", ROUND_1_COMPLETED: "Round 1 · Completed", ROUND_2_UPCOMING: "Round 2 · Upcoming", ROUND_2_LIVE: "Round 2 · Live", ROUND_2_COMPLETED: "Round 2 · Completed", FINAL_UPCOMING: "Final · Upcoming", FINAL_LIVE: "Final · Live", FINAL_COMPLETED: "Final · Completed", RESULTS_LIVE: "Results · Live" };
+
+type ParsedTeam = { teamId: string; teamName: string; venue: string };
+type Validation = { rows: ParsedTeam[]; errors: string[]; fileName: string };
+
+export default function Admin() {
+  const { user, loading, logout } = useAuth();
+  if (loading) return <AdminLoading />;
+  if (!user) return <AuthGate />;
+  if (user.role !== "admin") return <AccessDenied userName={user.name ?? "User"} logout={logout} />;
+  return <AdminConsole userName={user.name ?? "Administrator"} logout={logout} />;
+}
+
+function AdminConsole({ userName, logout }: { userName: string; logout: () => void }) {
+  const [tab, setTab] = useState<"overview" | "teams" | "import" | "settings" | "audit">("overview");
+  const [search, setSearch] = useState("");
+  const [venue, setVenue] = useState("ALL");
+  const [validation, setValidation] = useState<Validation | null>(null);
+  const [settingsDraft, setSettingsDraft] = useState<{ currentStage: typeof stages[number]; round1MaxScore: number; round2MaxScore: number } | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const utils = trpc.useUtils();
+  const summary = trpc.admin.summary.useQuery(undefined, { refetchInterval: 5000 });
+  const teams = trpc.admin.teams.useQuery({ search: search || undefined, venue: venue === "ALL" ? undefined : venue }, { enabled: tab === "teams", refetchInterval: 5000 });
+  const groups = trpc.admin.venueGroups.useQuery(undefined, { refetchInterval: 10000 });
+  const audit = trpc.admin.auditLog.useQuery({ limit: 50 }, { enabled: tab === "audit", refetchInterval: 5000 });
+  const updateScore = trpc.admin.updateScore.useMutation({ onSuccess: () => { toast.success("Score updated and audit logged"); utils.admin.invalidate(); utils.leaderboard.invalidate(); }, onError: error => toast.error(error.message) });
+  const updateTeam = trpc.admin.updateTeam.useMutation({ onSuccess: () => { toast.success("Team details updated"); utils.admin.invalidate(); }, onError: error => toast.error(error.message) });
+  const importTeams = trpc.admin.importTeams.useMutation({ onSuccess: result => { toast.success(`${result.count} teams imported without overwriting scores`); setValidation(null); utils.admin.invalidate(); utils.leaderboard.invalidate(); setTab("teams"); }, onError: error => toast.error(error.message) });
+  const updateSettings = trpc.admin.updateSettings.useMutation({ onSuccess: () => { toast.success("Event controls saved"); utils.admin.invalidate(); utils.leaderboard.invalidate(); }, onError: error => toast.error(error.message) });
+  const seedGroups = trpc.admin.seedVenueGroups.useMutation({ onSuccess: result => { toast.success(result.created ? "Default venue groups created" : "Venue groups already configured"); utils.admin.venueGroups.invalidate(); utils.leaderboard.invalidate(); } });
+  const settings = settingsDraft ?? summary.data?.settings;
+
+  const validateWorkbook = async (file: File) => {
+    const errors: string[] = [];
+    if (!/\.(xlsx|xls)$/i.test(file.name)) { setValidation({ rows: [], errors: ["Unsupported file format. Upload a .xlsx or .xls workbook."], fileName: file.name }); return; }
+    const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+    const matrix = XLSX.utils.sheet_to_json<unknown[]>(firstSheet, { header: 1, defval: "" });
+    if (!matrix.length) { setValidation({ rows: [], errors: ["The spreadsheet is empty."], fileName: file.name }); return; }
+    const headers = (matrix[0] as unknown[]).map(value => String(value).trim().toLowerCase());
+    const required = ["team id", "team name", "venue"];
+    const missing = required.filter(column => !headers.includes(column));
+    if (missing.length) errors.push(`Missing required column(s): ${missing.join(", ")}`);
+    const indices = { teamId: headers.indexOf("team id"), teamName: headers.indexOf("team name"), venue: headers.indexOf("venue") };
+    const rows: ParsedTeam[] = [];
+    const seen = new Map<string, number>();
+    (matrix.slice(1) as unknown[][]).forEach((raw, offset) => {
+      const rowNumber = offset + 2;
+      const values = { teamId: String(raw[indices.teamId] ?? "").trim(), teamName: String(raw[indices.teamName] ?? "").trim(), venue: String(raw[indices.venue] ?? "").trim() };
+      if (!values.teamId && !values.teamName && !values.venue) return;
+      if (!values.teamId) errors.push(`Row ${rowNumber}: Missing Team ID`);
+      if (!values.teamName) errors.push(`Row ${rowNumber}: Missing Team Name`);
+      if (!values.venue) errors.push(`Row ${rowNumber}: Missing Venue`);
+      if (values.venue && !/^G\d+$/i.test(values.venue)) errors.push(`Row ${rowNumber}: Invalid Venue "${values.venue}". Use a venue code such as G1 or G20.`);
+      if (values.teamId) { const normalized = values.teamId.toUpperCase(); if (seen.has(normalized)) errors.push(`Row ${rowNumber}: Duplicate Team ID ${values.teamId} (first seen on row ${seen.get(normalized)})`); else seen.set(normalized, rowNumber); }
+      rows.push(values);
+    });
+    if (!rows.length && !errors.length) errors.push("No team rows detected after ignoring empty rows.");
+    setValidation({ rows, errors, fileName: file.name });
+  };
+
+  const saveSettings = () => { if (settings) updateSettings.mutate({ currentStage: settings.currentStage as typeof stages[number], round1MaxScore: Number(settings.round1MaxScore), round2MaxScore: Number(settings.round2MaxScore) }); };
+
+  const navItems: Array<{ key: typeof tab; Icon: ComponentType<{ size?: number }>; label: string }> = [{ key: "overview", Icon: Gauge, label: "Overview" }, { key: "teams", Icon: Users, label: "Team management" }, { key: "import", Icon: FileSpreadsheet, label: "Excel import" }, { key: "settings", Icon: Settings2, label: "Event controls" }, { key: "audit", Icon: History, label: "Audit log" }];
+  return <div className="admin-app"><aside className="admin-sidebar"><div className="admin-brand"><div className="brand-mark"><span>G</span></div><div><p className="eyebrow text-cyan-300">GRADIENT CLUB</p><p className="font-display text-sm font-semibold text-white">SPECATHON 2026</p></div></div><div className="mt-10"><p className="eyebrow mb-3 px-3 text-slate-600">Control center</p><nav className="space-y-1">{navItems.map(({ key, Icon, label }) => <button key={key} onClick={() => setTab(key)} className={`admin-nav ${tab === key ? "active" : ""}`}><Icon size={17} />{label}</button>)}</nav></div><div className="mt-auto border-t border-white/10 pt-5"><div className="mb-4 flex items-center gap-3 px-3"><div className="avatar-small">{userName.charAt(0).toUpperCase()}</div><div className="min-w-0"><p className="truncate text-sm font-medium text-white">{userName}</p><p className="text-xs text-slate-500">Administrator</p></div></div><button onClick={logout} className="admin-nav text-slate-500"><LogOut size={17} />Sign out</button></div></aside><main className="admin-main"><header className="admin-topbar"><div><p className="eyebrow text-cyan-300">ADMIN CONTROL CENTER</p><h1 className="font-display mt-2 text-2xl font-semibold tracking-tight text-white">{tab === "overview" ? "Event overview" : tab === "teams" ? "Team management" : tab === "import" ? "Official Excel import" : tab === "settings" ? "Event controls" : "Score audit trail"}</h1></div><Link href="/" className="control-link"><ArrowLeft size={14} />Public leaderboard</Link></header><div className="admin-content">
+    {tab === "overview" && <Overview summary={summary.data} onNavigate={setTab} />}
+    {tab === "teams" && <TeamsTab rows={teams.data ?? []} search={search} setSearch={setSearch} venue={venue} setVenue={setVenue} groups={groups.data ?? []} onScore={(teamId, round, score) => updateScore.mutate({ teamId, round, score })} onEdit={(id, teamName, teamVenue) => updateTeam.mutate({ id, teamName, venue: teamVenue })} />}
+    {tab === "import" && <ImportTab validation={validation} fileRef={fileRef} onFile={file => void validateWorkbook(file)} onImport={() => validation && importTeams.mutate({ rows: validation.rows })} />}
+    {tab === "settings" && <SettingsTab settings={settings} groups={groups.data ?? []} setSettingsDraft={setSettingsDraft} saveSettings={saveSettings} seedGroups={() => seedGroups.mutate()} />}
+    {tab === "audit" && <AuditTab rows={audit.data ?? []} />}
+  </div></main></div>;
+}
+
+function Overview({ summary, onNavigate }: { summary: any; onNavigate: (tab: "teams" | "import" | "settings") => void }) {
+  const r1 = summary?.totalTeams ? Math.round((summary.round1Evaluated / summary.totalTeams) * 100) : 0;
+  const r2 = summary?.totalTeams ? Math.round((summary.round2Evaluated / summary.totalTeams) * 100) : 0;
+  return <><div className="overview-grid"><Metric label="Total teams" value={summary?.totalTeams ?? "—"} caption="Imported from official roster" /><Metric label="Round 1 evaluated" value={summary ? `${summary.round1Evaluated}/${summary.totalTeams}` : "—"} caption={`${r1}% complete`} /><Metric label="Round 2 evaluated" value={summary ? `${summary.round2Evaluated}/${summary.totalTeams}` : "—"} caption={`${r2}% complete`} /><Metric label="Current stage" value={summary?.settings ? stageLabels[summary.settings.currentStage].split(" · ")[0] : "—"} caption={summary?.settings ? stageLabels[summary.settings.currentStage].split(" · ")[1] : "Loading"} /></div><div className="dashboard-grid mt-6"><section className="panel"><div className="panel-heading"><div><p className="eyebrow text-cyan-300">Evaluation progress</p><h2 className="panel-title">Live completion</h2></div><span className="stage-pill live">{summary?.settings ? stageLabels[summary.settings.currentStage] : "Loading"}</span></div><ProgressLine label="Round 1" value={r1} evaluated={summary?.round1Evaluated ?? 0} total={summary?.totalTeams ?? 0} /><ProgressLine label="Round 2" value={r2} evaluated={summary?.round2Evaluated ?? 0} total={summary?.totalTeams ?? 0} /><div className="mt-8 grid gap-3 sm:grid-cols-3"><QuickAction label="Manage teams" icon={<Users size={17} />} onClick={() => onNavigate("teams")} /><QuickAction label="Import Excel" icon={<Upload size={17} />} onClick={() => onNavigate("import")} /><QuickAction label="Event controls" icon={<Settings2 size={17} />} onClick={() => onNavigate("settings")} /></div></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow text-cyan-300">Recent changes</p><h2 className="panel-title">Score audit</h2></div><History size={18} className="text-slate-600" /></div>{summary?.recentAudit?.length ? <div className="space-y-4">{summary.recentAudit.map((item: any) => <AuditItem key={item.id} item={item} />)}</div> : <EmptyPanel text="Score changes will appear here once evaluation begins." />}</section></div></>;
+}
+
+function TeamsTab({ rows, search, setSearch, venue, setVenue, groups, onScore, onEdit }: { rows: any[]; search: string; setSearch: (value: string) => void; venue: string; setVenue: (value: string) => void; groups: any[]; onScore: (teamId: number, round: "ROUND_1" | "ROUND_2", score: number) => void; onEdit: (id: number, name: string, venue: string) => void }) {
+  return <section className="panel"><div className="panel-heading"><div><p className="eyebrow text-cyan-300">Roster and scoring</p><h2 className="panel-title">{rows.length} teams in view</h2></div><div className="flex flex-wrap gap-2"><label className="search-box"><Search size={15} /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search team…" /></label><select className="dark-select" value={venue} onChange={e => setVenue(e.target.value)}><option value="ALL">All venues</option>{Array.from(new Set(groups.flatMap(group => group.venues))).map(item => <option key={item} value={item}>{item}</option>)}</select></div></div><div className="table-scroll"><table className="admin-table"><thead><tr><th>Team</th><th>Venue</th><th>Round 1</th><th>Round 2</th><th>Total</th><th>Save</th></tr></thead><tbody>{rows.map(row => <TeamEditor key={row.id} row={row} onScore={onScore} onEdit={onEdit} />)}{!rows.length && <tr><td colSpan={6} className="empty-row">No teams match the current filters.</td></tr>}</tbody></table></div></section>;
+}
+
+function TeamEditor({ row, onScore, onEdit }: { row: any; onScore: (teamId: number, round: "ROUND_1" | "ROUND_2", score: number) => void; onEdit: (id: number, name: string, venue: string) => void }) {
+  const [name, setName] = useState(row.teamName); const [venue, setVenue] = useState(row.venue); const [r1, setR1] = useState(row.round1Score ?? ""); const [r2, setR2] = useState(row.round2Score ?? "");
+  const total = (Number(r1) || 0) + (Number(r2) || 0);
+  return <tr><td><input className="table-input team-input" value={name} onChange={e => setName(e.target.value)} /><span className="team-id">{row.teamId}</span></td><td><input className="table-input venue-input" value={venue} onChange={e => setVenue(e.target.value)} /></td><td><input className="table-input score-input" type="number" min="0" value={r1} onChange={e => setR1(e.target.value)} onBlur={() => r1 !== "" && onScore(row.id, "ROUND_1", Number(r1))} /></td><td><input className="table-input score-input" type="number" min="0" value={r2} onChange={e => setR2(e.target.value)} onBlur={() => r2 !== "" && onScore(row.id, "ROUND_2", Number(r2))} /></td><td className="total-cell">{total}</td><td><button className="icon-button" onClick={() => onEdit(row.id, name, venue)} aria-label={`Save ${row.teamName}`}><Save size={16} /></button></td></tr>;
+}
+
+function ImportTab({ validation, fileRef, onFile, onImport }: { validation: Validation | null; fileRef: React.RefObject<HTMLInputElement | null>; onFile: (file: File) => void; onImport: () => void }) {
+  return <div className="grid gap-6 xl:grid-cols-[0.8fr_1.2fr]"><section className="panel"><p className="eyebrow text-cyan-300">Roster source</p><h2 className="panel-title">Validate before importing</h2><p className="mt-3 text-sm leading-6 text-slate-400">Upload the official workbook. Existing team IDs are updated, new IDs are added, and existing scores are never overwritten.</p><div className="mt-6 upload-zone" onClick={() => fileRef.current?.click()}><Upload className="mx-auto mb-3 text-cyan-300" size={25} /><p className="font-medium text-white">Choose .xlsx or .xls file</p><p className="mt-1 text-xs text-slate-500">Required columns: Team ID, Team Name, Venue</p><input ref={fileRef} className="hidden" type="file" accept=".xlsx,.xls" onChange={e => { const file = e.target.files?.[0]; if (file) onFile(file); }} /></div><button className="mt-5 flex w-full items-center justify-center gap-2 rounded-lg border border-white/10 px-4 py-3 text-sm text-slate-300 transition hover:border-cyan-300/40 hover:text-white" onClick={() => { const sheet = XLSX.utils.json_to_sheet([{ "Team ID": "SPC001", "Team Name": "Team Alpha", Venue: "G1" }]); const book = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(book, sheet, "Teams"); XLSX.writeFile(book, "specathon-2026-team-template.xlsx"); }}><FileSpreadsheet size={16} />Download official template</button></section><section className="panel"><div className="panel-heading"><div><p className="eyebrow text-cyan-300">Validation report</p><h2 className="panel-title">{validation?.fileName ?? "No workbook selected"}</h2></div>{validation && (validation.errors.length ? <Badge variant="destructive">Import blocked</Badge> : <Badge className="bg-emerald-400/15 text-emerald-300">Ready to import</Badge>)}</div>{!validation ? <EmptyPanel text="Your validation report will appear here before any data is written to the database." /> : <><div className="validation-summary"><div><span className="text-2xl font-semibold text-white">{validation.rows.length}</span><span className="ml-2 text-sm text-slate-500">team rows detected</span></div><div className={validation.errors.length ? "text-rose-300" : "text-emerald-300"}>{validation.errors.length ? `${validation.errors.length} issue(s)` : "All checks passed"}</div></div>{validation.errors.length ? <div className="error-list">{validation.errors.map((error, index) => <div key={index} className="flex gap-2 text-sm text-rose-200"><AlertTriangle size={16} className="mt-0.5 shrink-0" />{error}</div>)}</div> : <div className="success-callout"><Check size={18} /><div><p className="font-medium">Workbook ready</p><p className="text-sm opacity-75">Team IDs are unique and all required fields are present.</p></div></div>}<Button disabled={!!validation.errors.length || !validation.rows.length} onClick={onImport} className="mt-6 w-full bg-cyan-300 text-slate-950 hover:bg-cyan-200">Import validated teams</Button></>}</section></div>;
+}
+
+function SettingsTab({ settings, groups, setSettingsDraft, saveSettings, seedGroups }: { settings: any; groups: any[]; setSettingsDraft: (value: any) => void; saveSettings: () => void; seedGroups: () => void }) {
+  return <div className="grid gap-6 lg:grid-cols-2"><section className="panel"><p className="eyebrow text-cyan-300">Stage control</p><h2 className="panel-title">What is live now?</h2><div className="mt-6 space-y-5"><label className="field-label">Current event stage<select className="dark-select mt-2 w-full" value={settings?.currentStage ?? "ROUND_1_UPCOMING"} onChange={e => setSettingsDraft({ ...settings, currentStage: e.target.value })}>{stages.map(stage => <option key={stage} value={stage}>{stageLabels[stage]}</option>)}</select></label><div className="grid gap-4 sm:grid-cols-2"><label className="field-label">Round 1 maximum<input className="dark-input mt-2 w-full" type="number" min="1" max="1000" value={settings?.round1MaxScore ?? 40} onChange={e => setSettingsDraft({ ...settings, round1MaxScore: Number(e.target.value) })} /></label><label className="field-label">Round 2 maximum<input className="dark-input mt-2 w-full" type="number" min="1" max="1000" value={settings?.round2MaxScore ?? 40} onChange={e => setSettingsDraft({ ...settings, round2MaxScore: Number(e.target.value) })} /></label></div><Button onClick={saveSettings} className="mt-2 bg-cyan-300 text-slate-950 hover:bg-cyan-200"><Save size={16} />Save controls</Button></div></section><section className="panel"><p className="eyebrow text-cyan-300">Venue configuration</p><h2 className="panel-title">Public filter groups</h2><p className="mt-3 text-sm leading-6 text-slate-400">Groups are stored in the database so venue arrangements can change without editing the public application.</p><div className="mt-6 space-y-3">{groups.length ? groups.map(group => <div className="config-row" key={group.id}><span className="font-medium text-white">{group.groupName}</span><span className="text-xs text-slate-500">{group.venues.join(" · ")}</span></div>) : <><EmptyPanel text="No venue groups configured yet." /><Button variant="outline" onClick={seedGroups}>Create default groups</Button></>}</div></section></div>;
+}
+
+function AuditTab({ rows }: { rows: any[] }) { return <section className="panel"><div className="panel-heading"><div><p className="eyebrow text-cyan-300">Traceability</p><h2 className="panel-title">Every score change</h2></div><ShieldCheck className="text-cyan-300" size={20} /></div><div className="space-y-3">{rows.map(item => <AuditItem item={item} key={item.id} detailed />)}{!rows.length && <EmptyPanel text="No score modifications have been recorded." />}</div></section>; }
+function AuditItem({ item, detailed = false }: { item: any; detailed?: boolean }) { return <div className="audit-item"><div className="audit-icon"><History size={14} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm text-white">{item.teamName} <span className="text-slate-500">({item.teamId})</span></p><p className="mt-1 text-xs text-slate-500">{item.round.replace("ROUND_", "Round ")} · {item.changedBy ?? "Administrator"} · {new Date(item.changedAt).toLocaleString()}</p></div><div className="text-right"><p className="font-mono text-sm text-cyan-300">{item.oldScore ?? "—"} → {item.newScore}</p>{detailed && <p className="mt-1 text-[10px] uppercase tracking-widest text-slate-600">logged</p>}</div></div>; }
+function Metric({ label, value, caption }: { label: string; value: string | number; caption: string }) { return <div className="metric-card"><p className="eyebrow text-slate-500">{label}</p><p className="mt-4 font-display text-3xl font-semibold text-white">{value}</p><p className="mt-2 text-xs text-slate-500">{caption}</p></div>; }
+function ProgressLine({ label, value, evaluated, total }: { label: string; value: number; evaluated: number; total: number }) { return <div className="mt-6"><div className="mb-2 flex justify-between text-sm"><span className="text-slate-300">{label}</span><span className="font-mono text-cyan-300">{evaluated}/{total} · {value}%</span></div><Progress value={value} className="h-2 bg-white/10" /></div>; }
+function QuickAction({ label, icon, onClick }: { label: string; icon: React.ReactNode; onClick: () => void }) { return <button onClick={onClick} className="quick-action">{icon}<span>{label}</span></button>; }
+function EmptyPanel({ text }: { text: string }) { return <div className="empty-panel"><p>{text}</p></div>; }
+function AdminLoading() { return <div className="admin-loading"><div className="brand-mark"><span>G</span></div><p>Loading secure control center…</p></div>; }
+function AuthGate() { return <div className="admin-loading"><ShieldCheck size={26} className="text-cyan-300" /><h1 className="font-display text-2xl text-white">Administrator sign-in required</h1><p className="max-w-sm text-center text-sm leading-6 text-slate-500">This control center is protected by Manus OAuth. Public viewers can access the leaderboard without signing in.</p><Button onClick={() => startLogin()} className="bg-cyan-300 text-slate-950 hover:bg-cyan-200">Sign in securely</Button><Link href="/" className="text-sm text-slate-500 hover:text-white">Return to leaderboard</Link></div>; }
+function AccessDenied({ userName, logout }: { userName: string; logout: () => void }) { return <div className="admin-loading"><X size={26} className="text-rose-300" /><h1 className="font-display text-2xl text-white">Access denied</h1><p className="text-center text-sm text-slate-500">{userName} is authenticated, but this account is not authorized for admin controls.</p><Button variant="outline" onClick={logout}>Sign out</Button><Link href="/" className="text-sm text-slate-500 hover:text-white">Return to leaderboard</Link></div>; }
